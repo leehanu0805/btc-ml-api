@@ -1,6 +1,6 @@
 import json
 import warnings
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
@@ -29,7 +29,10 @@ warnings.filterwarnings("ignore")
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
 LOOKBACK_DAYS = 180
-BINANCE_FUTURES_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
+# USDⓈ-M Futures Klines endpoint
+BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+
 KLINE_LIMIT = 1000
 REQUEST_TIMEOUT = 30
 
@@ -75,7 +78,23 @@ def fetch_binance_futures_klines(symbol: str, interval: str, lookback_days: int)
             "endTime": end_time_ms,
             "limit": KLINE_LIMIT,
         }
-        response = session.get(BINANCE_FUTURES_KLINES_URL, params=params, timeout=REQUEST_TIMEOUT)
+
+        response = session.get(
+            BINANCE_FUTURES_KLINES_URL,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code == 451:
+            raise RuntimeError(
+                "Binance returned HTTP 451 (Unavailable For Legal Reasons). "
+                "This usually means the current server/IP/region is restricted by Binance. "
+                "The code was also previously using the wrong endpoint for futures. "
+                "Now it is using /fapi/v1/klines, but if 451 persists, the runtime environment itself is blocked.\n"
+                f"URL: {response.url}\n"
+                f"Response: {response.text}"
+            )
+
         response.raise_for_status()
         rows = response.json()
 
@@ -94,7 +113,7 @@ def fetch_binance_futures_klines(symbol: str, interval: str, lookback_days: int)
             break
 
     if not all_rows:
-        raise RuntimeError("No kline data returned from Binance API.")
+        raise RuntimeError("No kline data returned from Binance Futures API.")
 
     columns = [
         "open_time",
@@ -237,7 +256,6 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 def add_htf_features(base_df: pd.DataFrame) -> pd.DataFrame:
     data = base_df.copy()
 
-    # 15m features
     df_15m = resample_ohlcv(base_df, "15min")
     df_15m["ema_15m_21"] = ema(df_15m["close"], 21)
     df_15m["ema_15m_50"] = ema(df_15m["close"], 50)
@@ -246,7 +264,6 @@ def add_htf_features(base_df: pd.DataFrame) -> pd.DataFrame:
     df_15m["trend_15m"] = (df_15m["ema_15m_21"] - df_15m["ema_15m_50"]) / df_15m["close"].replace(0, np.nan)
     df_15m = df_15m[["open_time", "ema_15m_21", "ema_15m_50", "rsi_15m_14", "atr_15m_14", "trend_15m"]]
 
-    # 1h features
     df_1h = resample_ohlcv(base_df, "1h")
     df_1h["ema_1h_21"] = ema(df_1h["close"], 21)
     df_1h["ema_1h_50"] = ema(df_1h["close"], 50)
@@ -278,7 +295,6 @@ def add_htf_features(base_df: pd.DataFrame) -> pd.DataFrame:
 def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data = df.copy()
 
-    # Base returns and momentum
     data["ret_1"] = data["close"].pct_change()
     for lag in [1, 2, 3, 5, 8, 13, 21]:
         data[f"return_lag_{lag}"] = data["close"].pct_change(lag)
@@ -288,7 +304,6 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data["momentum_12"] = data["close"].pct_change(12)
     data["momentum_24"] = data["close"].pct_change(24)
 
-    # Indicators
     data["rsi_14"] = rsi(data["close"], 14)
     data["rsi_28"] = rsi(data["close"], 28)
 
@@ -323,7 +338,6 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data["stoch_d"] = stoch_d
     data["cci_20"] = cci(data["high"], data["low"], data["close"], 20)
 
-    # EMA trend stack
     for span in [9, 21, 50, 100, 200]:
         data[f"ema_{span}"] = ema(data["close"], span)
         data[f"ema_{span}_slope_1"] = data[f"ema_{span}"].pct_change()
@@ -344,7 +358,6 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data["close_vs_ema100"] = (data["close"] / data["ema_100"]) - 1
     data["close_vs_ema200"] = (data["close"] / data["ema_200"]) - 1
 
-    # Volume / flow proxy
     data["vol_mean_20"] = data["volume"].rolling(20).mean()
     data["vol_mean_100"] = data["volume"].rolling(100).mean()
     data["volume_ratio_20"] = data["volume"] / data["vol_mean_20"].replace(0, np.nan)
@@ -366,24 +379,20 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     ) / data["close"].replace(0, np.nan)
     data["hl_range_pct"] = (data["high"] - data["low"]) / data["close"].replace(0, np.nan)
 
-    # Quote / taker features
     data["avg_trade_size"] = data["quote_asset_volume"] / data["number_of_trades"].replace(0, np.nan)
     data["taker_buy_ratio"] = data["taker_buy_base_asset_volume"] / data["volume"].replace(0, np.nan)
     data["quote_volume_ratio"] = data["quote_asset_volume"] / data["quote_asset_volume"].rolling(20).mean().replace(0, np.nan)
 
-    # VWAP proxy (sessionless cumulative)
     pv = (data["close"] * data["volume"]).cumsum()
     vv = data["volume"].cumsum().replace(0, np.nan)
     data["vwap"] = pv / vv
     data["vwap_dist"] = (data["close"] - data["vwap"]) / data["vwap"].replace(0, np.nan)
 
-    # Regime / interactions
     data["volatility_x_trend"] = data["atr_pct"] * data["trend_strength_mid"]
     data["momentum_x_volume"] = data["momentum_6"] * data["volume_ratio_20"]
     data["breakout_pressure"] = data["bb_width"] * data["volume_ratio_20"]
     data["mean_reversion_pressure"] = data["bb_pos"] * data["rsi_14"]
 
-    # Higher timeframe context
     data = add_htf_features(data)
     data["multi_tf_trend_align"] = (
         np.sign(data["trend_strength_mid"].fillna(0))
@@ -391,7 +400,6 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
         + np.sign(data["trend_1h"].fillna(0))
     )
 
-    # Time features
     data["utc_hour"] = data["open_time"].dt.hour.astype(str)
     data["utc_dayofweek"] = data["open_time"].dt.dayofweek.astype(str)
     data["session_bucket"] = pd.cut(
@@ -449,9 +457,6 @@ CATEGORICAL_FEATURES = ["utc_hour", "utc_dayofweek", "session_bucket"]
 ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 
-# =========================================================
-# Split and validation
-# =========================================================
 def time_order_split(df: pd.DataFrame, train_ratio: float = 0.8) -> Tuple[pd.DataFrame, pd.DataFrame]:
     split_idx = int(len(df) * train_ratio)
     train_df = df.iloc[:split_idx].copy()
@@ -545,9 +550,6 @@ def run_walk_forward_cv(df: pd.DataFrame, n_folds: int = 5) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# =========================================================
-# Evaluation / backtest
-# =========================================================
 def evaluate_model(pipe: Pipeline, X_train, y_train, X_test, y_test):
     train_pred = pipe.predict(X_train)
     test_pred = pipe.predict(X_test)
@@ -691,9 +693,6 @@ def simple_backtest(test_df: pd.DataFrame, pred_classes: np.ndarray, fee_rate: f
     return trades_df, stats
 
 
-# =========================================================
-# Main train routine
-# =========================================================
 def main():
     print(f"Fetching Binance Futures {SYMBOL} {INTERVAL} candles...")
     raw_df = fetch_binance_futures_klines(SYMBOL, INTERVAL, LOOKBACK_DAYS)
