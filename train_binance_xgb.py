@@ -1,9 +1,6 @@
 import json
-import math
-import os
 import warnings
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import joblib
 import matplotlib.pyplot as plt
@@ -254,8 +251,12 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
 
     # Candle structure
     data["candle_body_pct"] = (data["close"] - data["open"]) / data["open"].replace(0, np.nan)
-    data["upper_wick_pct"] = (data[["high", "open", "close"]].max(axis=1) - data[["open", "close"]].max(axis=1)) / data["close"].replace(0, np.nan)
-    data["lower_wick_pct"] = (data[["open", "close"]].min(axis=1) - data["low"]) / data["close"].replace(0, np.nan)
+    data["upper_wick_pct"] = (
+        data[["high", "open", "close"]].max(axis=1) - data[["open", "close"]].max(axis=1)
+    ) / data["close"].replace(0, np.nan)
+    data["lower_wick_pct"] = (
+        data[["open", "close"]].min(axis=1) - data["low"]
+    ) / data["close"].replace(0, np.nan)
 
     # Time features (UTC)
     data["utc_hour"] = data["open_time"].dt.hour.astype(str)
@@ -522,7 +523,7 @@ def simple_backtest(test_df: pd.DataFrame, pred_classes: np.ndarray, fee_rate: f
 
         if signal == "BUY":
             gross_return = (exit_price / entry_price) - 1
-        else:  # SELL -> short
+        else:
             gross_return = (entry_price / exit_price) - 1
 
         net_return = gross_return - (2 * fee_rate)
@@ -635,18 +636,9 @@ def main():
         "training_rows": len(train_df),
         "test_rows": len(test_df),
     }
-    model_bundle = {
-    "model": final_model,
-    "feature_columns": feature_columns,
-    "label_map": {
-        0: "SELL",
-        1: "HOLD",
-        2: "BUY"
-    }
-}
 
-joblib.dump(model_bundle, "xgb_binance_btcusdt_5m.joblib")
-print("Saved model bundle -> xgb_binance_btcusdt_5m.joblib")
+    joblib.dump(bundle, MODEL_PATH)
+    print(f"Saved model bundle -> {MODEL_PATH}")
 
     summary = {
         "raw_rows": int(len(raw_df)),
