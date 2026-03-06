@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
-app = FastAPI(title="BTCUSDT XGBoost Signal API", version="1.0.0")
+app = FastAPI(title="BTCUSDT XGBoost Signal API", version="1.1.0")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -25,6 +25,9 @@ model_load_error: Optional[str] = None
 CLASS_TO_LABEL = {0: "SELL", 1: "HOLD", 2: "BUY"}
 
 
+# =========================
+# Request Schemas
+# =========================
 class Candle(BaseModel):
     open: float
     high: float
@@ -38,6 +41,15 @@ class PredictRequest(BaseModel):
     candles: List[Candle] = Field(..., min_length=100)
 
 
+class BatchPredictRequest(BaseModel):
+    candles: List[Candle] = Field(..., min_length=100)
+    window: int = Field(default=100, ge=30)
+    step: int = Field(default=10, ge=1)
+
+
+# =========================
+# Indicator Functions
+# =========================
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
@@ -104,6 +116,9 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
     return adx_val, plus_di, minus_di
 
 
+# =========================
+# Feature Engineering
+# =========================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
 
@@ -165,6 +180,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+# =========================
+# Model Utilities
+# =========================
 def find_existing_model_path() -> Optional[Path]:
     for p in CANDIDATE_MODEL_PATHS:
         if p is not None and p.exists():
@@ -216,6 +234,56 @@ def require_model():
     return model_bundle
 
 
+def _prepare_dataframe_from_candles(candles: List[Dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(candles).copy()
+
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "open_time" in df.columns and df["open_time"].notna().any():
+        df["open_time"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
+    else:
+        df["open_time"] = pd.date_range(
+            end=pd.Timestamp.utcnow(),
+            periods=len(df),
+            freq="5min",
+            tz="UTC",
+        )
+
+    df = df.sort_values("open_time").reset_index(drop=True)
+    return df
+
+
+def _predict_from_window_df(window_df: pd.DataFrame, bundle: Dict[str, Any]) -> Dict[str, Any]:
+    pipe = bundle["pipeline"]
+    feature_names = bundle["features"]
+    class_to_label = bundle.get("class_to_label", CLASS_TO_LABEL)
+
+    feat_df = build_features(window_df)
+    feat_df = feat_df.ffill().bfill()
+
+    X_last = feat_df.iloc[[-1]][feature_names].copy()
+    probs = pipe.predict_proba(X_last)[0]
+
+    pred_idx = int(np.argmax(probs))
+    signal = class_to_label.get(pred_idx, "HOLD")
+
+    probability_map = {
+        class_to_label.get(0, "SELL"): float(probs[0]),
+        class_to_label.get(1, "HOLD"): float(probs[1]),
+        class_to_label.get(2, "BUY"): float(probs[2]),
+    }
+
+    return {
+        "signal": signal,
+        "confidence": float(np.max(probs)),
+        "probabilities": probability_map,
+    }
+
+
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def root():
     model_path = find_existing_model_path()
@@ -251,54 +319,57 @@ def reload_model():
 @app.post("/predict")
 def predict(req: PredictRequest):
     bundle = require_model()
-    pipe = bundle["pipeline"]
-    feature_names = bundle["features"]
-    class_to_label = bundle.get("class_to_label", CLASS_TO_LABEL)
 
     candles = [c.model_dump() for c in req.candles]
     if len(candles) < 100:
         raise HTTPException(status_code=400, detail="At least 100 candles are required.")
 
     try:
-        df = pd.DataFrame(candles).copy()
-
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        if "open_time" in df.columns and df["open_time"].notna().any():
-            df["open_time"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
-        else:
-            df["open_time"] = pd.date_range(
-                end=pd.Timestamp.utcnow(),
-                periods=len(df),
-                freq="5min",
-                tz="UTC",
-            )
-
-        df = df.sort_values("open_time").reset_index(drop=True)
-        feat_df = build_features(df)
-        feat_df = feat_df.ffill().bfill()
-
-        X_last = feat_df.iloc[[-1]][feature_names].copy()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Feature generation failed: {repr(e)}")
-
-    try:
-        probs = pipe.predict_proba(X_last)[0]
+        df = _prepare_dataframe_from_candles(candles)
+        result = _predict_from_window_df(df, bundle)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {repr(e)}")
 
-    pred_idx = int(np.argmax(probs))
-    signal = class_to_label.get(pred_idx, "HOLD")
+    return result
 
-    probability_map = {
-        class_to_label.get(0, "SELL"): float(probs[0]),
-        class_to_label.get(1, "HOLD"): float(probs[1]),
-        class_to_label.get(2, "BUY"): float(probs[2]),
-    }
 
-    return {
-        "signal": signal,
-        "confidence": float(np.max(probs)),
-        "probabilities": probability_map,
-    }
+@app.post("/batch-predict")
+def batch_predict(req: BatchPredictRequest):
+    bundle = require_model()
+
+    candles = [c.model_dump() for c in req.candles]
+    total_len = len(candles)
+    window = req.window
+    step = req.step
+
+    if total_len < window:
+        raise HTTPException(
+            status_code=400,
+            detail=f"At least {window} candles are required for batch prediction.",
+        )
+
+    try:
+        df = _prepare_dataframe_from_candles(candles)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Input parsing failed: {repr(e)}")
+
+    predictions = []
+
+    try:
+        for end_idx in range(window, total_len + 1, step):
+            start_idx = end_idx - window
+            window_df = df.iloc[start_idx:end_idx].copy()
+
+            pred = _predict_from_window_df(window_df, bundle)
+            predictions.append(
+                {
+                    "index": end_idx,
+                    "signal": pred["signal"],
+                    "confidence": pred["confidence"],
+                    "probabilities": pred["probabilities"],
+                }
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {repr(e)}")
+
+    return {"predictions": predictions}
