@@ -1,6 +1,6 @@
 import json
 import warnings
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import joblib
 import matplotlib.pyplot as plt
@@ -27,12 +27,16 @@ warnings.filterwarnings("ignore")
 # Configuration
 # =========================================================
 SYMBOL = "BTCUSDT"
-INTERVAL = "5m"
+INTERVAL = "5"
 LOOKBACK_DAYS = 180
 
-# USDⓈ-M Futures Klines endpoint
-BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+# Bybit V5 endpoints
+BYBIT_BASE_URL = "https://api.bybit.com"
+BYBIT_KLINES_URL = f"{BYBIT_BASE_URL}/v5/market/kline"
+BYBIT_OPEN_INTEREST_URL = f"{BYBIT_BASE_URL}/v5/market/open-interest"
+BYBIT_FUNDING_HISTORY_URL = f"{BYBIT_BASE_URL}/v5/market/funding/history"
 
+BYBIT_CATEGORY = "linear"
 KLINE_LIMIT = 1000
 REQUEST_TIMEOUT = 30
 
@@ -56,64 +60,118 @@ LABEL_TO_CLASS = {v: k for k, v in CLASS_TO_LABEL.items()}
 TARGET_VALUE_TO_CLASS = {-1: 0, 0: 1, 1: 2}
 CLASS_TO_TARGET_VALUE = {v: k for k, v in TARGET_VALUE_TO_CLASS.items()}
 
+# Bybit open interest interval mapping
+OPEN_INTEREST_INTERVAL_MAP = {
+    "5": "5min",
+    "15": "15min",
+    "30": "30min",
+    "60": "1h",
+    "240": "4h",
+    "D": "1d",
+}
+
+
+# =========================================================
+# HTTP helpers
+# =========================================================
+def bybit_get(url: str, params: dict, session: requests.Session) -> dict:
+    response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+
+    if payload.get("retCode") != 0:
+        raise RuntimeError(
+            f"Bybit API error. url={response.url} retCode={payload.get('retCode')} "
+            f"retMsg={payload.get('retMsg')}"
+        )
+    return payload
+
 
 # =========================================================
 # Data fetching
 # =========================================================
-def fetch_binance_futures_klines(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
+def fetch_bybit_klines(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
+    """
+    Fetch Bybit linear perpetual klines and normalize them to the same
+    internal schema previously used for Binance.
+    """
     end_time_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     start_time_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).timestamp() * 1000)
 
     all_rows: List[list] = []
-    current_start = start_time_ms
+    current_end = end_time_ms
 
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
 
-    while current_start < end_time_ms:
+    # Bybit returns list sorted in reverse by startTime for this endpoint in many examples,
+    # so we page backward using end timestamps.
+    while current_end > start_time_ms:
         params = {
+            "category": BYBIT_CATEGORY,
             "symbol": symbol,
             "interval": interval,
-            "startTime": current_start,
-            "endTime": end_time_ms,
+            "start": start_time_ms,
+            "end": current_end,
             "limit": KLINE_LIMIT,
         }
 
-        response = session.get(
-            BINANCE_FUTURES_KLINES_URL,
-            params=params,
-            timeout=REQUEST_TIMEOUT,
-        )
-
-        if response.status_code == 451:
-            raise RuntimeError(
-                "Binance returned HTTP 451 (Unavailable For Legal Reasons). "
-                "This usually means the current server/IP/region is restricted by Binance. "
-                "The code was also previously using the wrong endpoint for futures. "
-                "Now it is using /fapi/v1/klines, but if 451 persists, the runtime environment itself is blocked.\n"
-                f"URL: {response.url}\n"
-                f"Response: {response.text}"
-            )
-
-        response.raise_for_status()
-        rows = response.json()
+        payload = bybit_get(BYBIT_KLINES_URL, params, session)
+        rows = payload.get("result", {}).get("list", [])
 
         if not rows:
             break
 
         all_rows.extend(rows)
 
-        last_open_time = rows[-1][0]
-        next_start = last_open_time + 1
-        if next_start <= current_start:
+        oldest_start = min(int(r[0]) for r in rows)
+        next_end = oldest_start - 1
+
+        if next_end >= current_end:
             break
-        current_start = next_start
+        current_end = next_end
 
         if len(rows) < KLINE_LIMIT:
             break
 
     if not all_rows:
-        raise RuntimeError("No kline data returned from Binance Futures API.")
+        raise RuntimeError("No kline data returned from Bybit API.")
+
+    # Bybit kline response format:
+    # [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+    df = pd.DataFrame(
+        all_rows,
+        columns=[
+            "open_time_ms",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "turnover",
+        ],
+    )
+
+    df = df.drop_duplicates(subset=["open_time_ms"]).sort_values("open_time_ms").reset_index(drop=True)
+
+    numeric_cols = ["open", "high", "low", "close", "volume", "turnover"]
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    interval_minutes = 5 if interval == "5" else None
+    if interval_minutes is None:
+        raise ValueError(f"Unsupported interval for close_time inference: {interval}")
+
+    df["open_time"] = pd.to_datetime(df["open_time_ms"].astype("int64"), unit="ms", utc=True)
+    df["close_time"] = df["open_time"] + pd.Timedelta(minutes=interval_minutes) - pd.Timedelta(milliseconds=1)
+
+    # Normalize to previous Binance-like internal schema
+    # Keep column names stable so downstream code / frontend contracts don't break.
+    df["quote_asset_volume"] = df["turnover"]
+    df["number_of_trades"] = np.nan
+    df["taker_buy_base_asset_volume"] = np.nan
+    df["taker_buy_quote_asset_volume"] = np.nan
+    df["ignore"] = np.nan
 
     columns = [
         "open_time",
@@ -129,26 +187,135 @@ def fetch_binance_futures_klines(symbol: str, interval: str, lookback_days: int)
         "taker_buy_quote_asset_volume",
         "ignore",
     ]
-    df = pd.DataFrame(all_rows, columns=columns)
-    df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+    return df[columns].copy()
 
-    numeric_cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_asset_volume",
-        "number_of_trades",
-        "taker_buy_base_asset_volume",
-        "taker_buy_quote_asset_volume",
-    ]
-    for c in numeric_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df
+def fetch_bybit_open_interest(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
+    interval_time = OPEN_INTEREST_INTERVAL_MAP.get(interval)
+    if interval_time is None:
+        return pd.DataFrame(columns=["open_time", "open_interest"])
+
+    end_time_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    start_time_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).timestamp() * 1000)
+
+    rows_out = []
+    cursor: Optional[str] = None
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    while True:
+        params = {
+            "category": BYBIT_CATEGORY,
+            "symbol": symbol,
+            "intervalTime": interval_time,
+            "startTime": start_time_ms,
+            "endTime": end_time_ms,
+            "limit": 200,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        payload = bybit_get(BYBIT_OPEN_INTEREST_URL, params, session)
+        result = payload.get("result", {})
+        rows = result.get("list", [])
+
+        if not rows:
+            break
+
+        rows_out.extend(rows)
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+
+    if not rows_out:
+        return pd.DataFrame(columns=["open_time", "open_interest"])
+
+    oi_df = pd.DataFrame(rows_out)
+    oi_df["open_time"] = pd.to_datetime(pd.to_numeric(oi_df["timestamp"], errors="coerce"), unit="ms", utc=True)
+    oi_df["open_interest"] = pd.to_numeric(oi_df["openInterest"], errors="coerce")
+    oi_df = oi_df[["open_time", "open_interest"]].dropna().drop_duplicates("open_time").sort_values("open_time")
+    return oi_df.reset_index(drop=True)
+
+
+def fetch_bybit_funding_history(symbol: str, lookback_days: int) -> pd.DataFrame:
+    end_time_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+    start_time_ms = int((pd.Timestamp.utcnow() - pd.Timedelta(days=lookback_days)).timestamp() * 1000)
+
+    all_rows = []
+    current_end = end_time_ms
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+    while current_end > start_time_ms:
+        params = {
+            "category": BYBIT_CATEGORY,
+            "symbol": symbol,
+            "startTime": start_time_ms,
+            "endTime": current_end,
+            "limit": 200,
+        }
+
+        payload = bybit_get(BYBIT_FUNDING_HISTORY_URL, params, session)
+        rows = payload.get("result", {}).get("list", [])
+
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+
+        oldest_time = min(int(r["fundingRateTimestamp"]) for r in rows)
+        next_end = oldest_time - 1
+        if next_end >= current_end:
+            break
+        current_end = next_end
+
+        if len(rows) < 200:
+            break
+
+    if not all_rows:
+        return pd.DataFrame(columns=["open_time", "funding_rate"])
+
+    funding_df = pd.DataFrame(all_rows)
+    funding_df["open_time"] = pd.to_datetime(
+        pd.to_numeric(funding_df["fundingRateTimestamp"], errors="coerce"),
+        unit="ms",
+        utc=True,
+    )
+    funding_df["funding_rate"] = pd.to_numeric(funding_df["fundingRate"], errors="coerce")
+    funding_df = (
+        funding_df[["open_time", "funding_rate"]]
+        .dropna()
+        .drop_duplicates("open_time")
+        .sort_values("open_time")
+        .reset_index(drop=True)
+    )
+    return funding_df
+
+
+def fetch_market_data(symbol: str, interval: str, lookback_days: int) -> pd.DataFrame:
+    df = fetch_bybit_klines(symbol, interval, lookback_days)
+
+    oi_df = fetch_bybit_open_interest(symbol, interval, lookback_days)
+    if not oi_df.empty:
+        df = pd.merge_asof(
+            df.sort_values("open_time"),
+            oi_df.sort_values("open_time"),
+            on="open_time",
+            direction="backward",
+        )
+
+    funding_df = fetch_bybit_funding_history(symbol, lookback_days)
+    if not funding_df.empty:
+        df = pd.merge_asof(
+            df.sort_values("open_time"),
+            funding_df.sort_values("open_time"),
+            on="open_time",
+            direction="backward",
+        )
+
+    return df.sort_values("open_time").reset_index(drop=True)
 
 
 # =========================================================
@@ -256,6 +423,7 @@ def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
 def add_htf_features(base_df: pd.DataFrame) -> pd.DataFrame:
     data = base_df.copy()
 
+    # 15m features
     df_15m = resample_ohlcv(base_df, "15min")
     df_15m["ema_15m_21"] = ema(df_15m["close"], 21)
     df_15m["ema_15m_50"] = ema(df_15m["close"], 50)
@@ -264,6 +432,7 @@ def add_htf_features(base_df: pd.DataFrame) -> pd.DataFrame:
     df_15m["trend_15m"] = (df_15m["ema_15m_21"] - df_15m["ema_15m_50"]) / df_15m["close"].replace(0, np.nan)
     df_15m = df_15m[["open_time", "ema_15m_21", "ema_15m_50", "rsi_15m_14", "atr_15m_14", "trend_15m"]]
 
+    # 1h features
     df_1h = resample_ohlcv(base_df, "1h")
     df_1h["ema_1h_21"] = ema(df_1h["close"], 21)
     df_1h["ema_1h_50"] = ema(df_1h["close"], 50)
@@ -295,6 +464,7 @@ def add_htf_features(base_df: pd.DataFrame) -> pd.DataFrame:
 def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data = df.copy()
 
+    # Base returns and momentum
     data["ret_1"] = data["close"].pct_change()
     for lag in [1, 2, 3, 5, 8, 13, 21]:
         data[f"return_lag_{lag}"] = data["close"].pct_change(lag)
@@ -304,6 +474,7 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data["momentum_12"] = data["close"].pct_change(12)
     data["momentum_24"] = data["close"].pct_change(24)
 
+    # Indicators
     data["rsi_14"] = rsi(data["close"], 14)
     data["rsi_28"] = rsi(data["close"], 28)
 
@@ -338,6 +509,7 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data["stoch_d"] = stoch_d
     data["cci_20"] = cci(data["high"], data["low"], data["close"], 20)
 
+    # EMA trend stack
     for span in [9, 21, 50, 100, 200]:
         data[f"ema_{span}"] = ema(data["close"], span)
         data[f"ema_{span}_slope_1"] = data[f"ema_{span}"].pct_change()
@@ -358,6 +530,7 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     data["close_vs_ema100"] = (data["close"] / data["ema_100"]) - 1
     data["close_vs_ema200"] = (data["close"] / data["ema_200"]) - 1
 
+    # Volume / flow proxy
     data["vol_mean_20"] = data["volume"].rolling(20).mean()
     data["vol_mean_100"] = data["volume"].rolling(100).mean()
     data["volume_ratio_20"] = data["volume"] / data["vol_mean_20"].replace(0, np.nan)
@@ -379,20 +552,46 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
     ) / data["close"].replace(0, np.nan)
     data["hl_range_pct"] = (data["high"] - data["low"]) / data["close"].replace(0, np.nan)
 
+    # Quote / taker features
     data["avg_trade_size"] = data["quote_asset_volume"] / data["number_of_trades"].replace(0, np.nan)
     data["taker_buy_ratio"] = data["taker_buy_base_asset_volume"] / data["volume"].replace(0, np.nan)
     data["quote_volume_ratio"] = data["quote_asset_volume"] / data["quote_asset_volume"].rolling(20).mean().replace(0, np.nan)
 
-    pv = (data["close"] * data["volume"]).cumsum()
-    vv = data["volume"].cumsum().replace(0, np.nan)
-    data["vwap"] = pv / vv
+    # Rolling VWAP proxy (better than sessionless cumulative VWAP for intraday)
+    pv_roll = (data["close"] * data["volume"]).rolling(96).sum()
+    vv_roll = data["volume"].rolling(96).sum().replace(0, np.nan)
+    data["vwap"] = pv_roll / vv_roll
     data["vwap_dist"] = (data["close"] - data["vwap"]) / data["vwap"].replace(0, np.nan)
 
+    # Bybit extra context if present
+    if "open_interest" in data.columns:
+        data["open_interest"] = pd.to_numeric(data["open_interest"], errors="coerce")
+        data["oi_change_1"] = data["open_interest"].pct_change()
+        data["oi_zscore_50"] = (
+            (data["open_interest"] - data["open_interest"].rolling(50).mean()) /
+            data["open_interest"].rolling(50).std().replace(0, np.nan)
+        )
+    else:
+        data["open_interest"] = np.nan
+        data["oi_change_1"] = np.nan
+        data["oi_zscore_50"] = np.nan
+
+    if "funding_rate" in data.columns:
+        data["funding_rate"] = pd.to_numeric(data["funding_rate"], errors="coerce")
+        data["funding_rate_change"] = data["funding_rate"].diff()
+    else:
+        data["funding_rate"] = np.nan
+        data["funding_rate_change"] = np.nan
+
+    # Regime / interactions
     data["volatility_x_trend"] = data["atr_pct"] * data["trend_strength_mid"]
     data["momentum_x_volume"] = data["momentum_6"] * data["volume_ratio_20"]
     data["breakout_pressure"] = data["bb_width"] * data["volume_ratio_20"]
     data["mean_reversion_pressure"] = data["bb_pos"] * data["rsi_14"]
+    data["oi_x_trend"] = data["oi_change_1"] * data["trend_strength_mid"]
+    data["funding_x_momentum"] = data["funding_rate"] * data["momentum_6"]
 
+    # Higher timeframe context
     data = add_htf_features(data)
     data["multi_tf_trend_align"] = (
         np.sign(data["trend_strength_mid"].fillna(0))
@@ -400,6 +599,7 @@ def build_features(df: pd.DataFrame, with_target: bool = True) -> pd.DataFrame:
         + np.sign(data["trend_1h"].fillna(0))
     )
 
+    # Time features
     data["utc_hour"] = data["open_time"].dt.hour.astype(str)
     data["utc_dayofweek"] = data["open_time"].dt.dayofweek.astype(str)
     data["session_bucket"] = pd.cut(
@@ -448,7 +648,10 @@ NUMERIC_FEATURES = [
     "buy_pressure", "sell_pressure", "candle_body_pct", "upper_wick_pct", "lower_wick_pct", "hl_range_pct",
     "avg_trade_size", "taker_buy_ratio", "quote_volume_ratio",
     "vwap", "vwap_dist",
+    "open_interest", "oi_change_1", "oi_zscore_50",
+    "funding_rate", "funding_rate_change",
     "volatility_x_trend", "momentum_x_volume", "breakout_pressure", "mean_reversion_pressure",
+    "oi_x_trend", "funding_x_momentum",
     "ema_15m_21", "ema_15m_50", "rsi_15m_14", "atr_15m_14", "trend_15m",
     "ema_1h_21", "ema_1h_50", "ema_1h_200", "rsi_1h_14", "atr_1h_14", "trend_1h", "close_vs_ema_1h_200",
     "multi_tf_trend_align",
@@ -457,6 +660,9 @@ CATEGORICAL_FEATURES = ["utc_hour", "utc_dayofweek", "session_bucket"]
 ALL_FEATURES = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 
 
+# =========================================================
+# Split and validation
+# =========================================================
 def time_order_split(df: pd.DataFrame, train_ratio: float = 0.8) -> Tuple[pd.DataFrame, pd.DataFrame]:
     split_idx = int(len(df) * train_ratio)
     train_df = df.iloc[:split_idx].copy()
@@ -550,6 +756,9 @@ def run_walk_forward_cv(df: pd.DataFrame, n_folds: int = 5) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# =========================================================
+# Evaluation / backtest
+# =========================================================
 def evaluate_model(pipe: Pipeline, X_train, y_train, X_test, y_test):
     train_pred = pipe.predict(X_train)
     test_pred = pipe.predict(X_test)
@@ -693,9 +902,12 @@ def simple_backtest(test_df: pd.DataFrame, pred_classes: np.ndarray, fee_rate: f
     return trades_df, stats
 
 
+# =========================================================
+# Main train routine
+# =========================================================
 def main():
-    print(f"Fetching Binance Futures {SYMBOL} {INTERVAL} candles...")
-    raw_df = fetch_binance_futures_klines(SYMBOL, INTERVAL, LOOKBACK_DAYS)
+    print(f"Fetching Bybit Futures {SYMBOL} 5m candles...")
+    raw_df = fetch_market_data(SYMBOL, INTERVAL, LOOKBACK_DAYS)
     print(f"Raw candles fetched: {len(raw_df):,}")
     print(f"Time range: {raw_df['open_time'].min()} -> {raw_df['open_time'].max()}")
 
@@ -739,8 +951,9 @@ def main():
 
     bundle = {
         "pipeline": pipe,
+        "exchange": "bybit",
         "symbol": SYMBOL,
-        "interval": INTERVAL,
+        "interval": "5m",
         "lookback_days": LOOKBACK_DAYS,
         "features": ALL_FEATURES,
         "numeric_features": NUMERIC_FEATURES,
@@ -761,6 +974,7 @@ def main():
     print(f"Saved model bundle -> {MODEL_PATH}")
 
     summary = {
+        "exchange": "bybit",
         "raw_rows": int(len(raw_df)),
         "feature_rows": int(len(feat_df)),
         "train_rows": int(len(train_df)),
