@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import joblib
 import numpy as np
@@ -32,6 +32,10 @@ CANDIDATE_MODEL_PATHS = [
 
 model_bundle: Optional[Dict[str, Any]] = None
 model_load_error: Optional[str] = None
+
+
+def utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
 
 
 # =========================
@@ -139,7 +143,7 @@ def build_features_from_candles(candles: List[Dict[str, Any]]) -> pd.DataFrame:
     else:
         # open_time이 없으면 더미 UTC 시간 생성
         df["open_time"] = pd.date_range(
-            end=pd.Timestamp.utcnow().tz_localize("UTC") if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow(),
+            end=utc_now(),
             periods=len(df),
             freq="5min",
             tz="UTC",
@@ -247,6 +251,144 @@ def build_features_from_candles(candles: List[Dict[str, Any]]) -> pd.DataFrame:
     return features
 
 
+def build_pipeline_features_from_candles(candles: List[Dict[str, Any]]) -> pd.DataFrame:
+    """
+    Build features compatible with the training pipeline bundle.
+    This mirrors the feature names used in train_binance_xgb.py.
+    """
+    df = pd.DataFrame(candles).copy()
+
+    required_cols = ["open", "high", "low", "close", "volume"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required field: {col}")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "open_time" in df.columns and df["open_time"].notna().any():
+        df["open_time"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
+    else:
+        df["open_time"] = pd.date_range(
+            end=utc_now(),
+            periods=len(df),
+            freq="5min",
+            tz="UTC",
+        )
+
+    df = df.sort_values("open_time").reset_index(drop=True)
+
+    # Core returns
+    df["ret_1"] = df["close"].pct_change()
+    for i in range(1, 6):
+        df[f"recent_ret_lag_{i}"] = df["close"].pct_change(i)
+
+    # Indicators
+    df["rsi_14"] = rsi(df["close"], 14)
+    df["macd_line"], df["macd_signal"], df["macd_hist"] = macd(df["close"], 12, 26, 9)
+
+    bb_mid, bb_upper, bb_lower = bollinger_bands(df["close"], 20, 2)
+    df["bb_mid"] = bb_mid
+    df["bb_upper"] = bb_upper
+    df["bb_lower"] = bb_lower
+    df["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
+    df["bb_pos"] = (df["close"] - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
+
+    df["atr_14"] = atr(df, 14)
+    df["atr_pct"] = df["atr_14"] / df["close"].replace(0, np.nan)
+
+    adx_val = adx(df, 14)
+    df["adx_14"] = adx_val
+
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+    atr_series = true_range(df).ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
+    df["plus_di"] = 100 * (plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_series)
+    df["minus_di"] = 100 * (minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_series)
+
+    # EMA and derived features
+    for span in [9, 21, 50]:
+        df[f"ema_{span}"] = ema(df["close"], span)
+        df[f"ema_{span}_slope_1"] = df[f"ema_{span}"].pct_change()
+        df[f"ema_{span}_slope_3"] = df[f"ema_{span}"].pct_change(3)
+
+    df["ema9_gt_ema21"] = (df["ema_9"] > df["ema_21"]).astype(int)
+    df["ema21_gt_ema50"] = (df["ema_21"] > df["ema_50"]).astype(int)
+    df["ema9_gt_ema50"] = (df["ema_9"] > df["ema_50"]).astype(int)
+
+    df["close_vs_ema9"] = (df["close"] / df["ema_9"]) - 1
+    df["close_vs_ema21"] = (df["close"] / df["ema_21"]) - 1
+    df["close_vs_ema50"] = (df["close"] / df["ema_50"]) - 1
+
+    df["vol_mean_20"] = df["volume"].rolling(20).mean()
+    df["volume_ratio_20"] = df["volume"] / df["vol_mean_20"].replace(0, np.nan)
+    df["volume_change_1"] = df["volume"].pct_change()
+
+    df["candle_body_pct"] = (df["close"] - df["open"]) / df["open"].replace(0, np.nan)
+    df["upper_wick_pct"] = (
+        df[["high", "open", "close"]].max(axis=1) - df[["open", "close"]].max(axis=1)
+    ) / df["close"].replace(0, np.nan)
+    df["lower_wick_pct"] = (
+        df[["open", "close"]].min(axis=1) - df["low"]
+    ) / df["close"].replace(0, np.nan)
+
+    # Categorical time features expected by training pipeline
+    df["utc_hour"] = df["open_time"].dt.hour.astype(str)
+    df["utc_dayofweek"] = df["open_time"].dt.dayofweek.astype(str)
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.ffill().bfill()
+
+    expected_columns = [
+        "open", "high", "low", "close", "volume",
+        "ret_1",
+        "recent_ret_lag_1", "recent_ret_lag_2", "recent_ret_lag_3", "recent_ret_lag_4", "recent_ret_lag_5",
+        "rsi_14",
+        "macd_line", "macd_signal", "macd_hist",
+        "bb_mid", "bb_upper", "bb_lower", "bb_width", "bb_pos",
+        "atr_14", "atr_pct", "adx_14", "plus_di", "minus_di",
+        "ema_9", "ema_21", "ema_50",
+        "ema_9_slope_1", "ema_21_slope_1", "ema_50_slope_1",
+        "ema_9_slope_3", "ema_21_slope_3", "ema_50_slope_3",
+        "ema9_gt_ema21", "ema21_gt_ema50", "ema9_gt_ema50",
+        "close_vs_ema9", "close_vs_ema21", "close_vs_ema50",
+        "volume_ratio_20", "volume_change_1",
+        "candle_body_pct", "upper_wick_pct", "lower_wick_pct",
+        "utc_hour", "utc_dayofweek",
+    ]
+    return df[expected_columns].copy()
+
+
+def get_predictor_from_bundle(bundle: Any) -> Tuple[str, Any, Optional[List[str]]]:
+    """
+    Returns (bundle_type, predictor, feature_columns)
+    - legacy bundle_type uses a bare model + feature_columns
+    - pipeline bundle_type uses sklearn Pipeline with internal preprocessor
+    - direct bundle_type uses model object itself (non-dict artifact)
+    """
+    if bundle is None:
+        raise HTTPException(status_code=500, detail="Model bundle is empty.")
+
+    if not isinstance(bundle, dict):
+        if hasattr(bundle, "predict_proba"):
+            return "direct", bundle, None
+        raise HTTPException(status_code=500, detail="Invalid model bundle structure.")
+
+    legacy_model = bundle.get("model")
+    legacy_columns = bundle.get("feature_columns")
+    if legacy_model is not None and legacy_columns is not None:
+        return "legacy", legacy_model, legacy_columns
+
+    pipeline = bundle.get("pipeline")
+    if pipeline is not None:
+        return "pipeline", pipeline, None
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"Invalid model bundle structure. keys={sorted(bundle.keys())}",
+    )
+
+
 # =========================
 # Model Utilities
 # =========================
@@ -337,27 +479,27 @@ def predict(req: PredictRequest):
     if len(candles) < 100:
         raise HTTPException(status_code=400, detail="At least 100 candles are required.")
 
+    bundle_type, predictor, feature_columns = get_predictor_from_bundle(bundle)
+
     try:
-        X_all = build_features_from_candles(candles)
-        X_last = X_all.iloc[[-1]].copy()
+        if bundle_type == "legacy":
+            X_all = build_features_from_candles(candles)
+            X_last = X_all.iloc[[-1]].copy()
+
+            missing_cols = [c for c in feature_columns if c not in X_last.columns]
+            for col in missing_cols:
+                X_last[col] = 0.0
+
+            X_last = X_last[feature_columns]
+            X_last = X_last.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        else:
+            X_all = build_pipeline_features_from_candles(candles)
+            X_last = X_all.iloc[[-1]].copy()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Feature generation failed: {repr(e)}")
 
-    feature_columns = bundle.get("feature_columns")
-    model = bundle.get("model")
-
-    if model is None or feature_columns is None:
-        raise HTTPException(status_code=500, detail="Invalid model bundle structure.")
-
-    missing_cols = [c for c in feature_columns if c not in X_last.columns]
-    for col in missing_cols:
-        X_last[col] = 0.0
-
-    X_last = X_last[feature_columns]
-    X_last = X_last.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
     try:
-        probs = model.predict_proba(X_last)[0]
+        probs = predictor.predict_proba(X_last)[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {repr(e)}")
 
