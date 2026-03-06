@@ -635,8 +635,18 @@ def main():
         "training_rows": len(train_df),
         "test_rows": len(test_df),
     }
-    joblib.dump(bundle, MODEL_PATH)
-    print(f"\nSaved model bundle -> {MODEL_PATH}")
+    model_bundle = {
+    "model": final_model,
+    "feature_columns": feature_columns,
+    "label_map": {
+        0: "SELL",
+        1: "HOLD",
+        2: "BUY"
+    }
+}
+
+joblib.dump(model_bundle, "xgb_binance_btcusdt_5m.joblib")
+print("Saved model bundle -> xgb_binance_btcusdt_5m.joblib")
 
     summary = {
         "raw_rows": int(len(raw_df)),
