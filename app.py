@@ -9,21 +9,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 
-# =========================
-# FastAPI App
-# =========================
 app = FastAPI(title="BTCUSDT XGBoost Signal API", version="1.0.0")
 
-
-# =========================
-# Paths / Globals
-# =========================
 BASE_DIR = Path(__file__).resolve().parent
 
-# 우선순위:
-# 1) ENV MODEL_PATH
-# 2) /app/model/xgb_binance_btcusdt_5m.joblib
-# 3) /app/xgb_binance_btcusdt_5m.joblib
 CANDIDATE_MODEL_PATHS = [
     Path(os.getenv("MODEL_PATH", "")).resolve() if os.getenv("MODEL_PATH") else None,
     BASE_DIR / "model" / "xgb_binance_btcusdt_5m.joblib",
@@ -33,10 +22,9 @@ CANDIDATE_MODEL_PATHS = [
 model_bundle: Optional[Dict[str, Any]] = None
 model_load_error: Optional[str] = None
 
+CLASS_TO_LABEL = {0: "SELL", 1: "HOLD", 2: "BUY"}
 
-# =========================
-# Request Schemas
-# =========================
+
 class Candle(BaseModel):
     open: float
     high: float
@@ -50,206 +38,133 @@ class PredictRequest(BaseModel):
     candles: List[Candle] = Field(..., min_length=100)
 
 
-# =========================
-# Indicator Functions
-# =========================
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(50)
+    return 100 - (100 / (1 + rs))
 
 
 def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    macd_line = ema(series, fast) - ema(series, slow)
+    ema_fast = ema(series, fast)
+    ema_slow = ema(series, slow)
+    macd_line = ema_fast - ema_slow
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
 
 def bollinger_bands(series: pd.Series, period: int = 20, num_std: float = 2.0):
-    mid = series.rolling(period).mean()
-    std = series.rolling(period).std()
-    upper = mid + num_std * std
-    lower = mid - num_std * std
-    return mid, upper, lower
+    ma = series.rolling(period).mean()
+    std = series.rolling(period).std(ddof=0)
+    upper = ma + num_std * std
+    lower = ma - num_std * std
+    return ma, upper, lower
 
 
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    ranges = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    )
+    return ranges.max(axis=1)
 
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tr = true_range(df)
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = true_range(high, low, close)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
+    up_move = high.diff()
+    down_move = -low.diff()
 
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
 
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    tr = true_range(high, low, close)
+    atr_val = tr.ewm(alpha=1 / period, adjust=False).mean()
 
-    tr = true_range(df)
-    atr_series = tr.ewm(alpha=1 / period, adjust=False).mean()
-
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_series
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_series
-
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
-    adx_series = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return adx_series.fillna(0)
+    plus_di = 100 * (plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_val.replace(0, np.nan))
+    minus_di = 100 * (minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_val.replace(0, np.nan))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_val = dx.ewm(alpha=1 / period, adjust=False).mean()
+    return adx_val, plus_di, minus_di
 
 
-# =========================
-# Feature Engineering
-# =========================
-def build_features_from_candles(candles: List[Dict[str, Any]]) -> pd.DataFrame:
-    df = pd.DataFrame(candles).copy()
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
 
-    required_cols = ["open", "high", "low", "close", "volume"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Missing required field: {col}")
-
-    for col in required_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "open_time" in df.columns and df["open_time"].notna().any():
-        df["open_time"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
-    else:
-        # open_time이 없으면 더미 UTC 시간 생성
-        df["open_time"] = pd.date_range(
-            end=pd.Timestamp.utcnow().tz_localize("UTC") if pd.Timestamp.utcnow().tzinfo is None else pd.Timestamp.utcnow(),
-            periods=len(df),
-            freq="5min",
-            tz="UTC",
-        )
-
-    # 기본 정렬
-    df = df.sort_values("open_time").reset_index(drop=True)
-
-    # Technical indicators
-    df["rsi_14"] = rsi(df["close"], 14)
-
-    df["macd"], df["macd_signal"], df["macd_hist"] = macd(df["close"], 12, 26, 9)
-
-    df["bb_mid"], df["bb_upper"], df["bb_lower"] = bollinger_bands(df["close"], 20, 2.0)
-    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"].replace(0, np.nan)
-    df["bb_pos"] = (df["close"] - df["bb_lower"]) / (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
-
-    df["atr_14"] = atr(df, 14)
-    df["adx_14"] = adx(df, 14)
-
-    # EMA
-    df["ema_9"] = ema(df["close"], 9)
-    df["ema_21"] = ema(df["close"], 21)
-    df["ema_50"] = ema(df["close"], 50)
-
-    # EMA cross states
-    df["ema9_gt_ema21"] = (df["ema_9"] > df["ema_21"]).astype(int)
-    df["ema21_gt_ema50"] = (df["ema_21"] > df["ema_50"]).astype(int)
-    df["ema9_gt_ema50"] = (df["ema_9"] > df["ema_50"]).astype(int)
-
-    df["ema9_21_spread"] = (df["ema_9"] - df["ema_21"]) / df["close"].replace(0, np.nan)
-    df["ema21_50_spread"] = (df["ema_21"] - df["ema_50"]) / df["close"].replace(0, np.nan)
-    df["ema9_50_spread"] = (df["ema_9"] - df["ema_50"]) / df["close"].replace(0, np.nan)
-
-    # EMA slopes
-    df["ema_9_slope"] = df["ema_9"].pct_change()
-    df["ema_21_slope"] = df["ema_21"].pct_change()
-    df["ema_50_slope"] = df["ema_50"].pct_change()
-
-    # Volume features
-    df["vol_sma_20"] = df["volume"].rolling(20).mean()
-    df["vol_ratio_20"] = df["volume"] / df["vol_sma_20"].replace(0, np.nan)
-    df["vol_change"] = df["volume"].pct_change()
-
-    # Recent returns pattern (최근 5봉)
-    df["ret_1"] = df["close"].pct_change(1)
+    data["ret_1"] = data["close"].pct_change()
     for i in range(1, 6):
-        df[f"recent_ret_lag_{i}"] = df["ret_1"].shift(i)
+        data[f"recent_ret_lag_{i}"] = data["close"].pct_change(i)
 
-    # Price range features
-    df["hl_range"] = (df["high"] - df["low"]) / df["close"].replace(0, np.nan)
-    df["oc_change"] = (df["close"] - df["open"]) / df["open"].replace(0, np.nan)
+    data["rsi_14"] = rsi(data["close"], 14)
 
-    # Time features (UTC)
-    df["hour_utc"] = df["open_time"].dt.hour.astype(int)
-    df["dayofweek_utc"] = df["open_time"].dt.dayofweek.astype(int)
+    macd_line, macd_signal, macd_hist = macd(data["close"], 12, 26, 9)
+    data["macd_line"] = macd_line
+    data["macd_signal"] = macd_signal
+    data["macd_hist"] = macd_hist
 
-    # 훈련 시 사용한 시간 원핫을 수동으로 고정 생성
-    for h in range(24):
-        df[f"hour_{h}"] = (df["hour_utc"] == h).astype(int)
+    bb_mid, bb_upper, bb_lower = bollinger_bands(data["close"], 20, 2)
+    data["bb_mid"] = bb_mid
+    data["bb_upper"] = bb_upper
+    data["bb_lower"] = bb_lower
+    data["bb_width"] = (bb_upper - bb_lower) / bb_mid.replace(0, np.nan)
+    data["bb_pos"] = (data["close"] - bb_lower) / (bb_upper - bb_lower).replace(0, np.nan)
 
-    for d in range(7):
-        df[f"dow_{d}"] = (df["dayofweek_utc"] == d).astype(int)
+    data["atr_14"] = atr(data["high"], data["low"], data["close"], 14)
+    data["atr_pct"] = data["atr_14"] / data["close"].replace(0, np.nan)
 
-    # 최종 피처
-    feature_columns = [
-        "rsi_14",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "bb_mid",
-        "bb_upper",
-        "bb_lower",
-        "bb_width",
-        "bb_pos",
-        "atr_14",
-        "adx_14",
-        "ema_9",
-        "ema_21",
-        "ema_50",
-        "ema9_gt_ema21",
-        "ema21_gt_ema50",
-        "ema9_gt_ema50",
-        "ema9_21_spread",
-        "ema21_50_spread",
-        "ema9_50_spread",
-        "ema_9_slope",
-        "ema_21_slope",
-        "ema_50_slope",
-        "vol_ratio_20",
-        "vol_change",
-        "hl_range",
-        "oc_change",
-        "recent_ret_lag_1",
-        "recent_ret_lag_2",
-        "recent_ret_lag_3",
-        "recent_ret_lag_4",
-        "recent_ret_lag_5",
-    ] + [f"hour_{h}" for h in range(24)] + [f"dow_{d}" for d in range(7)]
+    adx_val, plus_di, minus_di = adx(data["high"], data["low"], data["close"], 14)
+    data["adx_14"] = adx_val
+    data["plus_di"] = plus_di
+    data["minus_di"] = minus_di
 
-    features = df[feature_columns].copy()
-    features = features.replace([np.inf, -np.inf], np.nan)
-    features = features.ffill().bfill()
+    for span in [9, 21, 50]:
+        data[f"ema_{span}"] = ema(data["close"], span)
+        data[f"ema_{span}_slope_1"] = data[f"ema_{span}"].pct_change()
+        data[f"ema_{span}_slope_3"] = data[f"ema_{span}"].pct_change(3)
 
-    return features
+    data["ema9_gt_ema21"] = (data["ema_9"] > data["ema_21"]).astype(int)
+    data["ema21_gt_ema50"] = (data["ema_21"] > data["ema_50"]).astype(int)
+    data["ema9_gt_ema50"] = (data["ema_9"] > data["ema_50"]).astype(int)
+
+    data["close_vs_ema9"] = (data["close"] / data["ema_9"]) - 1
+    data["close_vs_ema21"] = (data["close"] / data["ema_21"]) - 1
+    data["close_vs_ema50"] = (data["close"] / data["ema_50"]) - 1
+
+    data["vol_mean_20"] = data["volume"].rolling(20).mean()
+    data["volume_ratio_20"] = data["volume"] / data["vol_mean_20"].replace(0, np.nan)
+    data["volume_change_1"] = data["volume"].pct_change()
+
+    data["candle_body_pct"] = (data["close"] - data["open"]) / data["open"].replace(0, np.nan)
+    data["upper_wick_pct"] = (
+        data[["high", "open", "close"]].max(axis=1) - data[["open", "close"]].max(axis=1)
+    ) / data["close"].replace(0, np.nan)
+    data["lower_wick_pct"] = (
+        data[["open", "close"]].min(axis=1) - data["low"]
+    ) / data["close"].replace(0, np.nan)
+
+    data["utc_hour"] = data["open_time"].dt.hour.astype(str)
+    data["utc_dayofweek"] = data["open_time"].dt.dayofweek.astype(str)
+
+    data = data.replace([np.inf, -np.inf], np.nan)
+    return data
 
 
-# =========================
-# Model Utilities
-# =========================
 def find_existing_model_path() -> Optional[Path]:
     for p in CANDIDATE_MODEL_PATHS:
         if p is not None and p.exists():
@@ -270,7 +185,14 @@ def load_model_if_available():
         return
 
     try:
-        model_bundle = joblib.load(model_path)
+        loaded = joblib.load(model_path)
+        if not isinstance(loaded, dict):
+            raise ValueError("Loaded joblib is not a dict bundle.")
+        if "pipeline" not in loaded:
+            raise ValueError("Loaded bundle does not contain 'pipeline'.")
+        if "features" not in loaded:
+            raise ValueError("Loaded bundle does not contain 'features'.")
+        model_bundle = loaded
         model_load_error = None
     except Exception as e:
         model_bundle = None
@@ -294,9 +216,6 @@ def require_model():
     return model_bundle
 
 
-# =========================
-# Routes
-# =========================
 @app.get("/")
 def root():
     model_path = find_existing_model_path()
@@ -332,48 +251,50 @@ def reload_model():
 @app.post("/predict")
 def predict(req: PredictRequest):
     bundle = require_model()
+    pipe = bundle["pipeline"]
+    feature_names = bundle["features"]
+    class_to_label = bundle.get("class_to_label", CLASS_TO_LABEL)
 
     candles = [c.model_dump() for c in req.candles]
     if len(candles) < 100:
         raise HTTPException(status_code=400, detail="At least 100 candles are required.")
 
     try:
-        X_all = build_features_from_candles(candles)
-        X_last = X_all.iloc[[-1]].copy()
+        df = pd.DataFrame(candles).copy()
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "open_time" in df.columns and df["open_time"].notna().any():
+            df["open_time"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
+        else:
+            df["open_time"] = pd.date_range(
+                end=pd.Timestamp.utcnow(),
+                periods=len(df),
+                freq="5min",
+                tz="UTC",
+            )
+
+        df = df.sort_values("open_time").reset_index(drop=True)
+        feat_df = build_features(df)
+        feat_df = feat_df.ffill().bfill()
+
+        X_last = feat_df.iloc[[-1]][feature_names].copy()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Feature generation failed: {repr(e)}")
 
-    feature_columns = bundle.get("feature_columns")
-    model = bundle.get("model")
-
-    if model is None or feature_columns is None:
-        raise HTTPException(status_code=500, detail="Invalid model bundle structure.")
-
-    missing_cols = [c for c in feature_columns if c not in X_last.columns]
-    for col in missing_cols:
-        X_last[col] = 0.0
-
-    X_last = X_last[feature_columns]
-    X_last = X_last.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
     try:
-        probs = model.predict_proba(X_last)[0]
+        probs = pipe.predict_proba(X_last)[0]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {repr(e)}")
 
-    # 학습 코드 기준 매핑:
-    # 0 -> SELL(-1)
-    # 1 -> HOLD(0)
-    # 2 -> BUY(1)
-    label_map = {0: "SELL", 1: "HOLD", 2: "BUY"}
-
     pred_idx = int(np.argmax(probs))
-    signal = label_map[pred_idx]
+    signal = class_to_label.get(pred_idx, "HOLD")
 
     probability_map = {
-        "SELL": float(probs[0]),
-        "HOLD": float(probs[1]),
-        "BUY": float(probs[2]),
+        class_to_label.get(0, "SELL"): float(probs[0]),
+        class_to_label.get(1, "HOLD"): float(probs[1]),
+        class_to_label.get(2, "BUY"): float(probs[2]),
     }
 
     return {
