@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore")
 SYMBOL = "BTCUSDT"
 INTERVAL = "5m"
 LOOKBACK_DAYS = 180
-BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_FUTURES_KLINES_URL = "https://api.binance.com/api/v3/klines"
 KLINE_LIMIT = 1000
 REQUEST_TIMEOUT = 30
 
